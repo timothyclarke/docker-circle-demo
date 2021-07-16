@@ -1,0 +1,197 @@
+version: 2.1
+
+executors:
+  tfhelm:
+    docker:
+      - image: leisurepassgroup/terraform-kubernetes:527
+    working_directory: ~
+  docker:
+    docker:
+      - image: docker:latest
+    working_directory: ~
+
+commands:
+  build-and-push:
+    steps:
+      - setup_remote_docker
+      - run:
+          name: Docker Build
+          command: |
+            source ${BASH_ENV}
+            cd src
+            docker build . \
+              -t timothyclarke/circle-demo:${BUILD_NUMBER} \
+              -t timothyclarke/circle-demo:latest
+      - run:
+          name: List images
+          command: docker images
+      - run:
+          name: Docker Login
+          command: |
+            source ${BASH_ENV}
+            docker login -u ${DOCKER_USERNAME} -p ${DOCKER_PASSWORD}
+      - run:
+          name: Docker Push
+          command: |
+            source ${BASH_ENV}
+            docker push timothyclarke/circle-demo:${BUILD_NUMBER}
+            docker push timothyclarke/circle-demo:latest
+
+  helm_deploy:
+    steps:
+      - run:
+          name: Setup K8s
+          command: |
+            mkdir ~/.kube || true
+            aws --region ${AWS_DEFAULT_REGION} eks update-kubeconfig --name ${EKS_CLUSTER}
+      - attach_workspace:
+          at: ~/reAttached
+      - run:
+          name: Read Build Number from Previous Step
+          command: |
+            echo "export BUILD_NUMBER=\"$(cat ~/reAttached/build-number.txt)\""   >> $BASH_ENV
+            source ${BASH_ENV}
+            echo "Build Number is ${BUILD_NUMBER}"
+      - run:
+          name: Restore HELM env if available
+          command: |
+            [[ -f ~/reAttached/helm.tgz ]] && tar -xzf ~/reAttached/helm.tgz || echo "No Helm archive found"
+      - run:
+          name: Env vars into values to address set and values override precedence
+          command: |
+            echo "'helm --set' overrides 'helm --values' no matter the order"
+            echo -e "image:\n  tag: ${BUILD_NUMBER}"  > container.yaml
+      - run:
+          name: Helm Deploy
+          command: |
+            source ${BASH_ENV}
+            helm upgrade demo demo \
+              --repo https://timothyclarke.github.io/helm-charts
+              --values container.yaml \
+              --history-max 3 \
+              `if [ -f "helm/defaults.yaml" ]; then echo "--values helm/defaults.yaml"; fi` \
+              `if [ -f "helm/${ENV}.yaml" ]; then echo "--values helm/${ENV}.yaml"; fi` \
+              --namespace demo \
+              --wait --timeout 5m \
+              --install
+
+
+
+jobs:
+  Primary Branch Build:
+    # This is the primary branch build. It will publish artifacts to Artifactory and at the conclusion of the job
+    executor: docker
+    environment:
+      BASE_VERSION: 0.1
+    steps:
+      - checkout
+      - run:
+          name: Persist Build number
+          command: |
+            echo "${BASE_VERSION}.<< pipeline.number >>"             > build-number.txt
+            echo "export BUILD_NUMBER=\"$(cat build-number.txt)\""  >> ${BASH_ENV}
+      - run:
+          name: Package Helm
+          command: |
+            cd .circleci
+            tar -czf ../helm.tgz helm
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build-number.txt
+            - helm.tgz
+      - build-and-push
+      - add_ssh_keys:
+          fingerprints:
+            - "6b:ed:c8:48:7c:76:67:f3:88:82:f6:f8:a3:50:b8:85"
+      - run:
+          name: Tag Commit
+          command: |
+            apk add --no-cache openssh-client git bash
+            mkdir -p ~/.ssh
+            ssh-keyscan github.com >> ~/.ssh/known_hosts
+            ssh-keyscan 140.82.114.3 >> ~/.ssh/known_hosts
+            git tag ${BUILD_NUMBER}
+            git push origin --tags
+
+  Alt Branch Build:
+    # This is the primary branch build. It will publish artifacts to Artifactory and at the conclusion of the job
+    executor: docker
+    steps:
+      - checkout
+      - run:
+          name: Persist Build number
+          command: |
+            echo "branch-${CIRCLE_BRANCH}.<< pipeline.number >>"     > build-number.txt
+            echo "export BUILD_NUMBER=\"$(cat build-number.txt)\""  >> $BASH_ENV
+      - run:
+          name: Package Helm
+          command: |
+            cd .circleci
+            tar -czf ../helm.tgz helm
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build-number.txt
+            - helm.tgz
+      - build-and-push
+
+  deploy_dev:
+    executor: tfhelm
+    environment:
+      ENV: dev
+    steps:
+      - helm_deploy
+
+  deploy_preProd:
+    executor: tfhelm
+    environment:
+      ENV: preprod
+    steps:
+      - helm_deploy
+
+workflows:
+  version: 2
+  Primary Branch:
+    jobs:
+      - Primary Branch Build:
+          context: Build
+          filters:
+            branches:
+              only:
+                - master
+      - deploy_dev:
+          name: DEV / QA deployment
+          requires:
+            - Primary Branch Build
+          context:
+            - dev_secrets
+      - Approve PreProd:
+          type: approval
+          requires:
+            - DEV / QA deployment
+      - deploy_preProd:
+          name: PreProd deployment
+          requires:
+            - Approve PreProd
+          context:
+            - preprod_secrets
+
+  Alternate Branches:
+    jobs:
+      - Alt Branch Build:
+          context: Build
+          filters:
+            branches:
+              ignore:
+                - master
+      - Approve Dev QA:
+          type: approval
+          requires:
+            - Alt Branch Build
+      - deploy_dev:
+          name: DEV / QA deployment
+          requires:
+            - Approve Dev QA
+          context:
+            - dev_secrets
